@@ -8,6 +8,7 @@ Usage:
   uv run python -m tv_backtesting optimize BTCUSD     # Mode 2: Optimize strategy for asset
   uv run python -m tv_backtesting explore BTCUSD      # Mode 2: Explore all indicator combos
   uv run python -m tv_backtesting agent [--local] [--once]  # Full agent with scheduling
+  uv run python -m tv_backtesting serve [--port 8000]       # HTTP API server for OpenClaw
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ Usage:
   python -m tv_backtesting optimize <SYMBOL>       Optimize Jamie Coutts params
   python -m tv_backtesting explore <SYMBOL>        Explore indicator combinations
   python -m tv_backtesting agent [--local] [--once] Full agent with scheduling
+  python -m tv_backtesting serve [--port 8000]      HTTP API server for OpenClaw
         """)
         return
 
@@ -35,6 +37,16 @@ Usage:
     if mode == "agent":
         from .agent.run import run_agent
         run_agent(args[1:])
+        return
+
+    if mode == "serve":
+        from .api import run_server
+        port = 8000
+        if "--port" in args:
+            idx = args.index("--port")
+            if idx + 1 < len(args):
+                port = int(args[idx + 1])
+        run_server(port=port)
         return
 
     if mode == "signal":
