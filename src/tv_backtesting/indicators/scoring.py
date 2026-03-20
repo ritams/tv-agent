@@ -58,7 +58,7 @@ def _filter_relevant_indicators(
             result.append(ind)
         elif "mri" in name:
             result.append(ind)
-        elif "rsi" in name and "divergen" in name:
+        elif "rsi" in name:
             result.append(ind)
     return result
 

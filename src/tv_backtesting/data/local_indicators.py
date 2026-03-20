@@ -111,48 +111,43 @@ def calc_rsi_divergence(
 # MRI — TD Sequential (hand-rolled)
 # ---------------------------------------------------------------------------
 
-def _td_sequential(candles: list[OHLCV]) -> tuple[int, bool, bool]:
+def _td_sequential_count(candles: list[OHLCV]) -> int:
     """
     Hand-rolled TD Sequential Setup phase.
-    Returns (count, buy_setup_complete, sell_setup_complete).
+    Returns the current streak count at the latest bar:
+      positive = consecutive closes < close[4] (bearish exhaustion / buy setup)
+      negative = consecutive closes > close[4] (bullish exhaustion / sell setup)
 
-    Buy Setup: 9 consecutive closes < close[4 bars earlier]
-    Sell Setup: 9 consecutive closes > close[4 bars earlier]
+    Buy Setup complete when count reaches +9.
+    Sell Setup complete when count reaches -9.
     """
     if len(candles) < 5:
-        return 0, False, False
+        return 0
 
     buy_count = 0
     sell_count = 0
-    buy_setup = False
-    sell_setup = False
 
     for i in range(4, len(candles)):
         if candles[i].close < candles[i - 4].close:
             buy_count += 1
             sell_count = 0
-            if buy_count >= 9:
-                buy_setup = True
         elif candles[i].close > candles[i - 4].close:
             sell_count += 1
             buy_count = 0
-            if sell_count >= 9:
-                sell_setup = True
         else:
             buy_count = 0
             sell_count = 0
 
-    current_count = buy_count if buy_count > 0 else -sell_count
-    return current_count, buy_setup, sell_setup
+    return buy_count if buy_count > 0 else -sell_count
 
 
 def calc_mri(candles: list[OHLCV]) -> LocalSignal:
-    count, buy_setup, sell_setup = _td_sequential(candles)
+    count = _td_sequential_count(candles)
 
-    if buy_setup:
-        return LocalSignal("MRI", 9, "buy", "TD Buy Setup complete (9-count)")
-    if sell_setup:
-        return LocalSignal("MRI", -9, "sell", "TD Sell Setup complete (9-count)")
+    if count >= 9:
+        return LocalSignal("MRI", count, "buy", f"TD Buy Setup complete ({count}-count)")
+    if count <= -9:
+        return LocalSignal("MRI", count, "sell", f"TD Sell Setup complete ({abs(count)}-count)")
 
     if count > 0:
         return LocalSignal("MRI", count, "neutral", f"TD Buy Setup: {count}/9")

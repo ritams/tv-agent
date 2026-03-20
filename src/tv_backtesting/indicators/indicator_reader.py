@@ -94,7 +94,10 @@ class IndicatorReader:
 
         for item in items:
             title_el = item.locator('[class*="title-"]').first
-            name = (await title_el.text_content() or "").strip()
+            try:
+                name = (await title_el.text_content(timeout=2000) or "").strip()
+            except Exception:
+                continue
             if not name:
                 continue
 
@@ -105,12 +108,18 @@ class IndicatorReader:
             value_items = await item.locator('[class*="valueItem-"]').all()
 
             for i, vi in enumerate(value_items):
-                text = (await vi.text_content() or "").strip()
+                try:
+                    text = (await vi.text_content(timeout=1000) or "").strip()
+                except Exception:
+                    text = ""
                 values[f"v{i}"] = text
 
-                style = await vi.evaluate(
-                    "(el) => { const s = getComputedStyle(el); return s.color || el.style.color || ''; }"
-                )
+                try:
+                    style = await vi.evaluate(
+                        "(el) => { const s = getComputedStyle(el); return s.color || el.style.color || ''; }"
+                    )
+                except Exception:
+                    style = ""
                 if style:
                     values[f"v{i}_color"] = style
 
@@ -136,11 +145,19 @@ class IndicatorReader:
         main_legend = self._page.locator('[class*="legendMainSourceWrapper"]').first
         if await _is_visible(main_legend):
             text = await main_legend.text_content() or ""
-            m = re.search(r"C([\d.]+)", text)
+            # Legend text: "...O69,921H71,356L69,399C69,75669,756∅..."
+            # C value runs into a duplicate. Use OHLC group and trim C by L's length.
+            m = re.search(r"O([\d,.]+)H([\d,.]+)L([\d,.]+)C([\d,.]+)", text)
             if m:
-                price = float(m.group(1))
-                if price > 0:
-                    return price
+                close_raw = m.group(4)
+                ref_len = len(m.group(3))  # L value has same digit structure
+                close_trimmed = close_raw[:ref_len]
+                try:
+                    price = float(close_trimmed.replace(",", ""))
+                    if price > 0:
+                        return price
+                except ValueError:
+                    pass
 
         value_els = await self._page.locator(
             '[class*="valueItem-"] [class*="valueTitle-"]'
@@ -149,9 +166,12 @@ class IndicatorReader:
             text = (await el.text_content() or "").strip()
             cleaned = re.sub(r"[^0-9.]", "", text)
             if cleaned:
-                num = float(cleaned)
-                if num > 0:
-                    return num
+                try:
+                    num = float(cleaned)
+                    if num > 0:
+                        return num
+                except ValueError:
+                    continue
         return 0.0
 
     async def snapshot(self, asset: str) -> ChartSnapshot:
