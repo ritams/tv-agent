@@ -1,0 +1,32 @@
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+.uv/
+
+# Environment
+.env
+.env.*
+
+# Session data
+*.session.json
+tv-session.json
+
+# Playwright
+playwright-data/
+screenshots/
+
+# Backtest output
+backtest-results/
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

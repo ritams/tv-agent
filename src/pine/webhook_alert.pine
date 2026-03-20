@@ -1,0 +1,49 @@
+// Pine Script v5 — Jamie Coutts Signal Webhook Alert
+// Add this to TradingView, then create an alert with webhook URL:
+// POST http://your-server:3000/webhook
+//
+// Alert message template (paste this in the "Message" field):
+// {"ticker":"{{ticker}}","price":"{{close}}","time":"{{time}}","indicator":"JC-Composite","signal":"{{strategy.order.action}}","score":"3"}
+
+//@version=5
+indicator("JC Signal Webhook", overlay=true)
+
+// === RSI Divergence ===
+rsiLen = input.int(14, "RSI Length")
+rsiOversold = input.int(30, "RSI Oversold")
+rsiVal = ta.rsi(close, rsiLen)
+priceLow = ta.lowest(low, 5)
+rsiLow = ta.lowest(rsiVal, 5)
+prevPriceLow = ta.lowest(low[5], 5)
+prevRsiLow = ta.lowest(rsiVal[5], 5)
+rsiBullDiv = (priceLow < prevPriceLow) and (rsiLow > prevRsiLow) and (rsiVal < rsiOversold + 10)
+rsiSignal = rsiBullDiv or (rsiVal < rsiOversold)
+
+// === MRI (TD Sequential style) ===
+mriMA = ta.ema(close, 10)
+mriCount = 0
+mriCount := close < mriMA ? (nz(mriCount[1]) + 1) : 0
+mriBuySignal = (mriCount >= 9)
+
+// === Chameleon (vol contraction + trend) ===
+atrVal = ta.atr(14)
+atrMA = ta.sma(atrVal, 20)
+volContraction = atrVal < atrMA * 0.8
+trendMA50 = ta.sma(close, 50)
+trendMA200 = ta.sma(close, 200)
+chameleonSignal = volContraction and (trendMA50 > trendMA200) and (close > trendMA50)
+
+// === Scoring ===
+score = (rsiSignal ? 1 : 0) + (mriBuySignal ? 1 : 0) + (chameleonSignal ? 1 : 0)
+
+// === Alerts ===
+// Big Buy: 3/3
+alertcondition(score >= 3, title="Big Buy", message='{"ticker":"{{ticker}}","price":"{{close}}","time":"{{time}}","indicator":"JC-Composite","signal":"buy","score":"3"}')
+
+// Partial Buy: 2/3
+alertcondition(score >= 2 and score < 3, title="Partial Buy", message='{"ticker":"{{ticker}}","price":"{{close}}","time":"{{time}}","indicator":"JC-Composite","signal":"buy","score":"2"}')
+
+// Visual
+bgcolor(score >= 3 ? color.new(color.green, 85) : score >= 2 ? color.new(color.yellow, 85) : na)
+plotshape(score >= 3, "Big Buy", shape.labelup, location.belowbar, color.green, size=size.small)
+plotshape(score >= 2 and score < 3, "Partial Buy", shape.labelup, location.belowbar, color.yellow, size=size.small)
