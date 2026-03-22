@@ -87,10 +87,11 @@ class IndicatorReader:
             await self._page.wait_for_timeout(3000)
         return enabled
 
-    async def read_legend_indicators(self) -> list[IndicatorValue]:
+    async def read_legend_indicators(self, verbose: bool = False) -> list[IndicatorValue]:
         indicators: list[IndicatorValue] = []
         items = await self._page.locator('[class*="item-"][class*="study-"]').all()
-        print(f"  Found {len(items)} indicator items in legend")
+        if verbose:
+            print(f"  Found {len(items)} indicator items in legend")
 
         for item in items:
             title_el = item.locator('[class*="title-"]').first
@@ -204,25 +205,254 @@ def _interpret_signal(
     indicator_name: str, values: dict[str, str | float]
 ) -> str:
     name = indicator_name.lower()
+
+    # --- Chameleon LV / HV ---
+    # v0-v3 are price bands, v4/v5 are signal plots.
+    # Colors: rgb(76,175,80) = green (bullish), rgb(242,54,69) = red (bearish)
+    # Buy when majority of v0-v5 colors are green.
     if any(k in name for k in ("chameleon", "hv v2", "lv v2")):
+        return _interpret_chameleon(values)
+
+    # --- MRI ---
+    # Many value plots (v0-v49). Has green/red zones:
+    #   rgb(0,100,0) / rgb(34,139,34) = green (buy zone)
+    #   rgb(179,0,0) / rgb(255,96,96) = red (sell zone)
+    #   rgb(255,152,0) = orange (transition)
+    #   rgb(120,123,134) = gray (neutral)
+    # Buy signal when green-colored values have non-zero text; sell when red do.
+    if name == "mri":
+        return _interpret_mri(values)
+
+    # --- LuxAlgo Signals & Overlays ---
+    # v1/v2 colored rgb(53,205,120) = green (buy signals)
+    # v3/v4 colored rgb(255,0,0) = red (sell signals)
+    # Signal fires when these values are non-zero.
+    if "luxalgo" in name and "signal" in name:
+        return _interpret_luxalgo_signals(values)
+
+    # --- TCG BackBurner ---
+    # v0: rgb(255,0,103) = pink/red (sell pressure)
+    # v1: rgb(15,237,127) = green (buy pressure)
+    # Signal based on which has a non-zero value.
+    if "backburner" in name:
+        return _interpret_tcg_backburner(values)
+
+    # --- TCG Hist. RSI ---
+    # v0 = RSI value. v5/v6 green (overbought bands), v7/v8 pink (oversold bands)
+    # v13 green = bullish signal, v14 pink = bearish signal
+    if "hist" in name and "rsi" in name:
+        return _interpret_tcg_hist_rsi(values)
+
+    # --- TCG SuperStack Pro ---
+    # All values are ∅ when no signal. Non-∅ values indicate active signals.
+    # Need to check for non-empty values and their colors.
+    if "superstack" in name:
+        return _interpret_by_active_values(values)
+
+    # --- TCG MVS / MM Trend Scout ---
+    # These may have no value items (legend shows just the name).
+    # Check if any colored values exist at all.
+    if "mm trend" in name or "tcg mvs" in name:
+        return _interpret_by_active_values(values)
+
+    # --- GLI-TR ---
+    # v0 has a color: rgb(76,175,80) = green, rgb(255,255,0) = yellow, etc.
+    if "gli-tr" in name:
+        return _interpret_glitr(values)
+
+    # --- Trade Keeper ---
+    # v1 has a price level with color rgb(255,82,82) = red (resistance) or green (support)
+    if "trade keeper" in name:
         return _interpret_by_color(values)
-    if "mri" in name:
-        return _interpret_by_color(values)
+
+    # --- RSI (standard) ---
+    if name == "rsi" or (name.startswith("rsi") and "divergen" not in name):
+        return _interpret_rsi(values)
+
+    # --- RSI Divergence ---
     if "rsi" in name and "divergen" in name:
         return _interpret_by_color(values)
-    if name == "rsi" or name.startswith("rsi"):
-        return _interpret_rsi(values)
+
+    # --- Fallback: color-based ---
+    return _interpret_by_color(values)
+
+
+def _interpret_chameleon(values: dict[str, str | float]) -> str:
+    """Chameleon LV/HV: check colors of value plots. Green = bullish, Red = bearish."""
+    green_count = 0
+    red_count = 0
+    for key, val in values.items():
+        if "color" not in key or key == "_disabled":
+            continue
+        r, g, b = _parse_rgb(str(val))
+        if r < 0:
+            continue
+        if g > 120 and g > r * 1.3:  # green-ish
+            green_count += 1
+        if r > 120 and r > g * 1.3:  # red-ish
+            red_count += 1
+    if green_count > red_count:
+        return "buy"
+    if red_count > green_count:
+        return "sell"
+    return "neutral"
+
+
+def _interpret_mri(values: dict[str, str | float]) -> str:
+    """MRI: look for non-zero values in green vs red colored slots."""
+    green_active = 0
+    red_active = 0
+    for i in range(50):
+        val_key = f"v{i}"
+        color_key = f"v{i}_color"
+        span_key = f"v{i}_span_color"
+        color_str = str(values.get(span_key, values.get(color_key, "")))
+        text = str(values.get(val_key, "")).strip()
+
+        if not text or text in ("0", "∅", ""):
+            continue
+
+        r, g, b = _parse_rgb(color_str)
+        if r < 0:
+            continue
+        # Green family: (0,100,0), (34,139,34), (15,237,127)
+        if g > 80 and g > r * 1.3:
+            green_active += 1
+        # Red family: (179,0,0), (255,96,96), (255,0,103)
+        if r > 120 and r > g * 1.5:
+            red_active += 1
+
+    if green_active > red_active:
+        return "buy"
+    if red_active > green_active:
+        return "sell"
+    # Fallback: check v9 (orange = transition), v34-v41 for directional plots
+    return "neutral"
+
+
+def _interpret_luxalgo_signals(values: dict[str, str | float]) -> str:
+    """LuxAlgo Signals & Overlays: v1/v2 green (buy), v3/v4 red (sell), non-zero = active."""
+    buy_active = False
+    sell_active = False
+
+    for i in [1, 2]:
+        text = str(values.get(f"v{i}", "")).strip()
+        color = str(values.get(f"v{i}_span_color", values.get(f"v{i}_color", "")))
+        r, g, b = _parse_rgb(color)
+        if text and text != "0" and text != "∅" and g > 100 and g > r:
+            buy_active = True
+
+    for i in [3, 4]:
+        text = str(values.get(f"v{i}", "")).strip()
+        color = str(values.get(f"v{i}_span_color", values.get(f"v{i}_color", "")))
+        r, g, b = _parse_rgb(color)
+        if text and text != "0" and text != "∅" and r > 100 and r > g:
+            sell_active = True
+
+    # Also check v10 trend direction: -1 = bearish, 1 = bullish
+    v10 = str(values.get("v10", "")).strip()
+    if v10 == "1":
+        buy_active = True
+    elif v10 == "-1" or v10 == "−1":
+        sell_active = True
+
+    if buy_active and not sell_active:
+        return "buy"
+    if sell_active and not buy_active:
+        return "sell"
+    return "neutral"
+
+
+def _interpret_tcg_backburner(values: dict[str, str | float]) -> str:
+    """TCG BackBurner: v0 pink/red = sell, v1 green = buy. Non-zero = active."""
+    v0 = str(values.get("v0", "")).strip()
+    v1 = str(values.get("v1", "")).strip()
+
+    buy_val = float(v1) if v1 and v1 not in ("∅", "") else 0
+    sell_val = float(v0) if v0 and v0 not in ("∅", "") else 0
+
+    if buy_val > 0 and buy_val > sell_val:
+        return "buy"
+    if sell_val > 0 and sell_val > buy_val:
+        return "sell"
+    return "neutral"
+
+
+def _interpret_tcg_hist_rsi(values: dict[str, str | float]) -> str:
+    """TCG Hist. RSI: v0 is RSI value. v13 green = bullish signal, v14 pink = bearish."""
+    # Check signal plots first
+    v13 = str(values.get("v13", "")).strip()
+    v14 = str(values.get("v14", "")).strip()
+
+    v13_val = float(v13) if v13 and v13 not in ("∅", "") else 0
+    v14_val = float(v14) if v14 and v14 not in ("∅", "") else 0
+
+    if v13_val > 0 and v14_val == 0:
+        return "buy"
+    if v14_val > 0 and v13_val == 0:
+        return "sell"
+
+    # Fallback to RSI value
+    v0 = str(values.get("v0", "")).strip()
+    if v0 and v0 not in ("∅", ""):
+        try:
+            rsi = float(v0)
+            if rsi < 30:
+                return "buy"
+            if rsi > 70:
+                return "sell"
+        except ValueError:
+            pass
+    return "neutral"
+
+
+def _interpret_glitr(values: dict[str, str | float]) -> str:
+    """GLI-TR: color of v0 indicates trend. Green = buy, red/yellow = neutral/sell."""
+    color = str(values.get("v0_span_color", values.get("v0_color", "")))
+    r, g, b = _parse_rgb(color)
+    if r < 0:
+        return "neutral"
+    if g > 120 and g > r * 1.3:
+        return "buy"
+    if r > 120 and r > g * 1.3:
+        return "sell"
+    return "neutral"
+
+
+def _interpret_by_active_values(values: dict[str, str | float]) -> str:
+    """Generic: check if any non-∅ values exist with green or red colors."""
+    green = 0
+    red = 0
+    for key, val in values.items():
+        if "color" not in key or key == "_disabled":
+            continue
+        # Only count if the corresponding value is non-empty
+        val_key = key.replace("_span_color", "").replace("_color", "")
+        text = str(values.get(val_key, "")).strip()
+        if not text or text in ("∅", "0", ""):
+            continue
+        r, g, b = _parse_rgb(str(val))
+        if r < 0:
+            continue
+        if g > 120 and g > r * 1.3:
+            green += 1
+        if r > 120 and r > g * 1.3:
+            red += 1
+    if green > red:
+        return "buy"
+    if red > green:
+        return "sell"
     return "neutral"
 
 
 def _interpret_by_color(values: dict[str, str | float]) -> str:
+    """Fallback: scan all color values for green/red."""
     for key, val in values.items():
         s = str(val).lower()
         if "color" not in key:
             continue
-        m = re.match(r"rgb\((\d+),\s*(\d+),\s*(\d+)\)", s)
-        if m:
-            r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        r, g, b = _parse_rgb(s)
+        if r >= 0:
             if g > 120 and g > r * 1.5:
                 return "buy"
             if r > 120 and r > g * 1.5:
@@ -246,6 +476,14 @@ def _interpret_rsi(values: dict[str, str | float]) -> str:
             if num > 70:
                 return "sell"
     return "neutral"
+
+
+def _parse_rgb(color_str: str) -> tuple[int, int, int]:
+    """Extract r, g, b from 'rgb(r, g, b)'. Returns (-1,-1,-1) if no match."""
+    m = re.match(r"rgb\((\d+),\s*(\d+),\s*(\d+)\)", color_str.strip().lower())
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return -1, -1, -1
 
 
 async def _is_visible(locator, timeout: int = 3000) -> bool:

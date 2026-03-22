@@ -1,4 +1,15 @@
-"""Bar replay backtester — drives TradingView bar replay via Playwright."""
+"""
+Optimized bar replay backtester using real TradingView indicators.
+
+How it works:
+1. Opens a chart for the given asset (e.g., BTCUSD)
+2. Enables TradingView's "Bar Replay" — rewinds the chart to the past
+3. Steps forward one bar at a time (each bar = 1 day on daily chart)
+4. At each bar, reads every indicator's signal from the chart legend
+5. After collecting all bars, simulates trades per-indicator and ranks them
+
+This reads the ACTUAL invite-only indicator signals, not approximations.
+"""
 
 from __future__ import annotations
 
@@ -10,43 +21,36 @@ from datetime import datetime, timezone
 from playwright.async_api import Page
 
 from ..indicators.indicator_reader import IndicatorReader
-from ..indicators.scoring import ChartSnapshot, ScoredSignal, score_snapshot
 
 
 @dataclass
-class BacktestConfig:
+class BarData:
+    bar: int
+    price: float
+    signals: dict[str, str]  # indicator_name -> "buy"|"sell"|"neutral"
+
+
+@dataclass
+class IndicatorResult:
+    name: str
+    trades: int
+    wins: int
+    win_rate: float
+    avg_return: float
+    total_return: float
+    max_drawdown: float
+    buy_bars: int
+    sell_bars: int
+
+
+@dataclass
+class ReplayBacktestResult:
     symbol: str
-    bars: int
     timeframe: str
-
-
-@dataclass
-class Trade:
-    entry_date: datetime
-    entry_price: float
-    exit_date: datetime | None = None
-    exit_price: float | None = None
-    signal_level: str = ""
-    pnl_percent: float | None = None
-
-
-@dataclass
-class BacktestStats:
-    total_signals: int = 0
-    big_buys: int = 0
-    partial_buys: int = 0
-    win_rate: float = 0.0
-    avg_return: float = 0.0
-    max_drawdown: float = 0.0
-    total_return: float = 0.0
-
-
-@dataclass
-class BacktestResult:
-    config: BacktestConfig
-    signals: list[ScoredSignal]
-    trades: list[Trade]
-    stats: BacktestStats
+    total_bars: int
+    hold_bars: int
+    bar_data: list[BarData]
+    indicator_results: list[IndicatorResult]
 
 
 class Backtester:
@@ -54,45 +58,242 @@ class Backtester:
         self._page = page
         self._reader = IndicatorReader(page)
 
-    async def run(self, cfg: BacktestConfig) -> BacktestResult:
-        print(f"\nStarting backtest: {cfg.symbol} | {cfg.timeframe} | {cfg.bars} bars")
+    async def run(
+        self,
+        symbol: str,
+        bars: int = 100,
+        timeframe: str = "1D",
+        hold_bars: int = 10,
+        target_indicators: list[str] | None = None,
+    ) -> ReplayBacktestResult:
+        """
+        Run a bar replay backtest on the given symbol.
 
-        await self._reader.open_chart(cfg.symbol)
-        await self._set_timeframe(cfg.timeframe)
+        Args:
+            symbol: Asset ticker (e.g., "BTCUSD")
+            bars: Number of bars to replay through
+            timeframe: Chart timeframe (e.g., "1D", "4H")
+            hold_bars: How many bars to hold a trade before exiting
+            target_indicators: Only track these indicators (None = all)
+        """
+        print(f"\n{'='*60}")
+        print(f"  Bar Replay Backtest")
+        print(f"  {symbol} | {timeframe} | {bars} bars | hold={hold_bars}")
+        print(f"{'='*60}\n")
+
+        # Step 1: Open chart
+        print("  [1/5] Opening chart...")
+        await self._reader.open_chart(symbol)
+        await self._set_timeframe(timeframe)
         await self._page.wait_for_timeout(2000)
 
+        # Step 2: Enable bar replay and position
+        print("  [2/5] Enabling bar replay...")
         await self._enable_bar_replay()
-        await self._go_to_start(cfg.bars)
 
-        snapshots: list[ChartSnapshot] = []
-        signals: list[ScoredSignal] = []
+        # Step 3: Collect data bar by bar
+        print(f"  [3/5] Replaying {bars} bars...")
+        bar_data = await self._collect_bars(symbol, bars, target_indicators)
 
-        for i in range(cfg.bars):
-            if i % 50 == 0:
-                print(f"  Bar {i}/{cfg.bars}...")
-
-            try:
-                snap = await self._reader.snapshot(cfg.symbol)
-                snapshots.append(snap)
-                scored = score_snapshot(snap)
-                if scored.level != "none":
-                    signals.append(scored)
-            except Exception as e:
-                print(f"  Warning: Error reading bar {i}: {e}")
-
-            await self._step_forward()
-            await self._page.wait_for_timeout(300)
-
+        # Step 4: Exit replay
+        print("  [4/5] Exiting replay...")
         await self._disable_bar_replay()
 
-        trades = self._simulate_trades(signals, snapshots)
-        stats = self._calculate_stats(signals, trades)
-        result = BacktestResult(config=cfg, signals=signals, trades=trades, stats=stats)
+        # Step 5: Analyze results
+        print("  [5/5] Analyzing...")
+        indicator_results = self._analyze(bar_data, hold_bars)
 
+        result = ReplayBacktestResult(
+            symbol=symbol,
+            timeframe=timeframe,
+            total_bars=len(bar_data),
+            hold_bars=hold_bars,
+            bar_data=bar_data,
+            indicator_results=indicator_results,
+        )
+
+        self._print_results(result)
         self._save_results(result)
-        print(f"\nBacktest complete: {cfg.symbol}")
-        self._print_stats(stats)
+
         return result
+
+    async def _collect_bars(
+        self,
+        symbol: str,
+        bars: int,
+        target_indicators: list[str] | None,
+    ) -> list[BarData]:
+        """Step through bars and read indicator signals. Optimized for speed."""
+        data: list[BarData] = []
+
+        for bar in range(bars):
+            if bar % 25 == 0:
+                pct = int(bar / bars * 100)
+                print(f"         {bar}/{bars} ({pct}%)")
+
+            try:
+                # Read price
+                price = await self._reader.get_current_price()
+
+                # Read indicators — fast path: only read legend once
+                indicators = await self._reader.read_legend_indicators()
+
+                signals: dict[str, str] = {}
+                for ind in indicators:
+                    if target_indicators:
+                        # Only track indicators we care about
+                        if not any(t.lower() in ind.name.lower() for t in target_indicators):
+                            continue
+                    signals[ind.name] = ind.signal
+
+                data.append(BarData(bar=bar, price=price, signals=signals))
+
+            except Exception:
+                pass  # skip bad bars silently
+
+            # Step forward — minimal delay
+            await self._page.keyboard.down("Shift")
+            await self._page.keyboard.press("ArrowRight")
+            await self._page.keyboard.up("Shift")
+            await self._page.wait_for_timeout(250)
+
+        print(f"         {bars}/{bars} (100%) — done")
+        return data
+
+    def _analyze(
+        self, bar_data: list[BarData], hold_bars: int
+    ) -> list[IndicatorResult]:
+        """Simulate trades per-indicator and compute stats."""
+        # Get all indicator names
+        all_names: set[str] = set()
+        for bd in bar_data:
+            all_names.update(bd.signals.keys())
+
+        results: list[IndicatorResult] = []
+
+        for name in sorted(all_names):
+            # Simulate: enter on buy, hold for hold_bars, then exit
+            trades: list[float] = []
+            in_trade = False
+            entry_price = 0.0
+            entry_bar = 0
+            buy_bars = 0
+            sell_bars = 0
+
+            for bd in bar_data:
+                sig = bd.signals.get(name, "neutral")
+                if sig == "buy":
+                    buy_bars += 1
+                elif sig == "sell":
+                    sell_bars += 1
+
+                if not in_trade and sig == "buy" and bd.price > 0:
+                    in_trade = True
+                    entry_price = bd.price
+                    entry_bar = bd.bar
+                elif in_trade and bd.bar - entry_bar >= hold_bars and bd.price > 0:
+                    pnl = ((bd.price - entry_price) / entry_price) * 100
+                    trades.append(pnl)
+                    in_trade = False
+
+            # Stats
+            total_trades = len(trades)
+            wins = sum(1 for t in trades if t > 0)
+            total_return = sum(trades)
+            avg_return = total_return / total_trades if total_trades else 0
+
+            # Max drawdown
+            peak = 0.0
+            cum = 0.0
+            max_dd = 0.0
+            for r in trades:
+                cum += r
+                if cum > peak:
+                    peak = cum
+                dd = peak - cum
+                if dd > max_dd:
+                    max_dd = dd
+
+            results.append(IndicatorResult(
+                name=name,
+                trades=total_trades,
+                wins=wins,
+                win_rate=(wins / total_trades * 100) if total_trades else 0,
+                avg_return=round(avg_return, 2),
+                total_return=round(total_return, 2),
+                max_drawdown=round(max_dd, 2),
+                buy_bars=buy_bars,
+                sell_bars=sell_bars,
+            ))
+
+        # Sort by total return descending
+        results.sort(key=lambda r: r.total_return, reverse=True)
+        return results
+
+    def _print_results(self, result: ReplayBacktestResult) -> None:
+        print(f"\n{'='*80}")
+        print(f"  {result.symbol} — {result.total_bars} bars | hold={result.hold_bars} bars")
+        print(f"{'='*80}")
+        print(
+            f"  {'Indicator':<42} {'Trades':>6} {'Win%':>7} "
+            f"{'Avg':>8} {'Total':>8} {'MaxDD':>7} {'Buy':>4} {'Sell':>4}"
+        )
+        print(f"  {'-'*42} {'-'*6} {'-'*7} {'-'*8} {'-'*8} {'-'*7} {'-'*4} {'-'*4}")
+
+        for r in result.indicator_results:
+            if r.trades > 0:
+                print(
+                    f"  {r.name:<42} {r.trades:>6} {r.win_rate:>6.1f}% "
+                    f"{r.avg_return:>+7.2f}% {r.total_return:>+7.2f}% "
+                    f"{r.max_drawdown:>6.2f}% {r.buy_bars:>4} {r.sell_bars:>4}"
+                )
+            else:
+                print(
+                    f"  {r.name:<42} {'—':>6} {'—':>7} "
+                    f"{'—':>8} {'—':>8} {'—':>7} {r.buy_bars:>4} {r.sell_bars:>4}"
+                )
+
+        # Best performer
+        with_trades = [r for r in result.indicator_results if r.trades >= 2]
+        if with_trades:
+            best = with_trades[0]  # already sorted by total_return
+            print(f"\n  Best: {best.name} — {best.total_return:+.2f}% total, "
+                  f"{best.win_rate:.0f}% win rate, {best.trades} trades")
+
+    def _save_results(self, result: ReplayBacktestResult) -> None:
+        d = "./backtest-results"
+        os.makedirs(d, exist_ok=True)
+        ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+        filename = f"{d}/replay-{result.symbol}-{result.timeframe}-{ts}.json"
+
+        data = {
+            "symbol": result.symbol,
+            "timeframe": result.timeframe,
+            "total_bars": result.total_bars,
+            "hold_bars": result.hold_bars,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "indicator_results": [
+                {
+                    "name": r.name,
+                    "trades": r.trades,
+                    "wins": r.wins,
+                    "win_rate": r.win_rate,
+                    "avg_return": r.avg_return,
+                    "total_return": r.total_return,
+                    "max_drawdown": r.max_drawdown,
+                    "buy_bars": r.buy_bars,
+                    "sell_bars": r.sell_bars,
+                }
+                for r in result.indicator_results
+            ],
+        }
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"\n  Results saved: {filename}")
+
+    # ------------------------------------------------------------------
+    # TradingView controls
+    # ------------------------------------------------------------------
 
     async def _set_timeframe(self, tf: str) -> None:
         tf_map = {
@@ -122,49 +323,31 @@ class Backtester:
         await self._page.wait_for_timeout(2000)
 
     async def _enable_bar_replay(self) -> None:
-        print("  -> Enabling bar replay...")
+        # Find the VISIBLE replay button (there may be multiple, only one is visible)
+        replay_btns = await self._page.locator('button[aria-label="Bar Replay"]').all()
+        for btn in replay_btns:
+            try:
+                if await btn.is_visible(timeout=500):
+                    await btn.click()
+                    await self._page.wait_for_timeout(2000)
+                    break
+            except Exception:
+                continue
 
-        replay_btn = self._page.locator(
-            '[data-name="replay"], [data-tooltip="Bar Replay"], button[aria-label*="Replay"]'
-        ).first
-
-        try:
-            if await replay_btn.is_visible():
-                await replay_btn.click()
-                await self._page.wait_for_timeout(1000)
-            else:
-                toolbar_btns = await self._page.locator('[class*="toolbar"] button').all()
-                for btn in toolbar_btns:
-                    text = await btn.get_attribute("aria-label") or ""
-                    tooltip = await btn.get_attribute("data-tooltip") or ""
-                    if "replay" in text.lower() or "replay" in tooltip.lower():
-                        await btn.click()
-                        await self._page.wait_for_timeout(1000)
-                        break
-        except Exception:
-            pass
-
-        chart_area = self._page.locator('[class*="chart-markup-table"], canvas').first
+        # Click left side of chart to start replay from further back in history
+        chart_area = self._page.locator("canvas").first
         box = await chart_area.bounding_box()
         if box:
             await chart_area.click(
-                force=True, position={"x": box["width"] * 0.1, "y": box["height"] / 2}
+                force=True,
+                position={"x": box["width"] * 0.15, "y": box["height"] / 2},
             )
-            await self._page.wait_for_timeout(1000)
-
-        print("  Bar replay enabled")
-
-    async def _go_to_start(self, bars: int) -> None:
-        print(f"  -> Positioning {bars} bars back...")
-
-    async def _step_forward(self) -> None:
-        await self._page.keyboard.down("Shift")
-        await self._page.keyboard.press("ArrowRight")
-        await self._page.keyboard.up("Shift")
+            await self._page.wait_for_timeout(2000)
 
     async def _disable_bar_replay(self) -> None:
         exit_btn = self._page.locator(
-            '[data-name="replay-exit"], [data-tooltip*="Exit replay"], button:has-text("Exit Replay")'
+            '[data-name="replay-exit"], [data-tooltip*="Exit replay"], '
+            'button:has-text("Exit Replay")'
         ).first
         try:
             if await exit_btn.is_visible():
@@ -172,107 +355,3 @@ class Backtester:
         except Exception:
             pass
         await self._page.wait_for_timeout(1000)
-
-    def _simulate_trades(
-        self, signals: list[ScoredSignal], snapshots: list[ChartSnapshot]
-    ) -> list[Trade]:
-        trades: list[Trade] = []
-        hold_bars = 10
-
-        for signal in signals:
-            entry_idx = next(
-                (
-                    j
-                    for j, s in enumerate(snapshots)
-                    if s.timestamp >= signal.timestamp
-                ),
-                -1,
-            )
-            if entry_idx == -1:
-                continue
-
-            exit_idx = min(entry_idx + hold_bars, len(snapshots) - 1)
-            exit_snap = snapshots[exit_idx]
-
-            pnl = ((exit_snap.price - signal.price) / signal.price * 100) if signal.price else None
-
-            trades.append(
-                Trade(
-                    entry_date=signal.timestamp,
-                    entry_price=signal.price,
-                    exit_date=exit_snap.timestamp,
-                    exit_price=exit_snap.price,
-                    signal_level=signal.level,
-                    pnl_percent=pnl,
-                )
-            )
-        return trades
-
-    def _calculate_stats(
-        self, signals: list[ScoredSignal], trades: list[Trade]
-    ) -> BacktestStats:
-        completed = [t for t in trades if t.pnl_percent is not None]
-        wins = [t for t in completed if (t.pnl_percent or 0) > 0]
-        returns = [t.pnl_percent or 0 for t in completed]
-
-        max_dd = 0.0
-        peak = 0.0
-        cum = 0.0
-        for r in returns:
-            cum += r
-            if cum > peak:
-                peak = cum
-            dd = peak - cum
-            if dd > max_dd:
-                max_dd = dd
-
-        return BacktestStats(
-            total_signals=len(signals),
-            big_buys=sum(1 for s in signals if s.level == "big_buy"),
-            partial_buys=sum(1 for s in signals if s.level == "partial_buy"),
-            win_rate=(len(wins) / len(completed) * 100) if completed else 0,
-            avg_return=(sum(returns) / len(returns)) if returns else 0,
-            max_drawdown=max_dd,
-            total_return=cum,
-        )
-
-    def _print_stats(self, stats: BacktestStats) -> None:
-        print(f"  Total Signals: {stats.total_signals}")
-        print(f"     Big Buys: {stats.big_buys}")
-        print(f"     Partial Buys: {stats.partial_buys}")
-        print(f"     Win Rate: {stats.win_rate:.1f}%")
-        print(f"     Avg Return: {stats.avg_return:.2f}%")
-        print(f"     Max Drawdown: {stats.max_drawdown:.2f}%")
-        print(f"     Total Return: {stats.total_return:.2f}%")
-
-    def _save_results(self, result: BacktestResult) -> None:
-        d = "./backtest-results"
-        os.makedirs(d, exist_ok=True)
-        ts = int(datetime.now(timezone.utc).timestamp() * 1000)
-        filename = f"{d}/{result.config.symbol}-{result.config.timeframe}-{ts}.json"
-
-        # Serialize dataclasses to JSON-compatible dict
-        data = {
-            "config": {"symbol": result.config.symbol, "bars": result.config.bars, "timeframe": result.config.timeframe},
-            "signals": [
-                {"asset": s.asset, "level": s.level, "score": s.score, "total": s.total,
-                 "price": s.price, "timestamp": s.timestamp.isoformat(), "details": s.details}
-                for s in result.signals
-            ],
-            "trades": [
-                {"entry_date": t.entry_date.isoformat(), "entry_price": t.entry_price,
-                 "exit_date": t.exit_date.isoformat() if t.exit_date else None,
-                 "exit_price": t.exit_price, "signal_level": t.signal_level,
-                 "pnl_percent": t.pnl_percent}
-                for t in result.trades
-            ],
-            "stats": {
-                "total_signals": result.stats.total_signals, "big_buys": result.stats.big_buys,
-                "partial_buys": result.stats.partial_buys, "win_rate": result.stats.win_rate,
-                "avg_return": result.stats.avg_return, "max_drawdown": result.stats.max_drawdown,
-                "total_return": result.stats.total_return,
-            },
-        }
-        with open(filename, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"  Results saved: {filename}")

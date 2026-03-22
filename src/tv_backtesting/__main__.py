@@ -54,9 +54,19 @@ Usage:
     elif mode == "backtest":
         asset = args[1] if len(args) > 1 else None
         if not asset:
-            print("Usage: python -m tv_backtesting backtest <SYMBOL>")
+            print("Usage: python -m tv_backtesting backtest <SYMBOL> [--bars 100] [--hold 10]")
             sys.exit(1)
-        asyncio.run(_backtest_mode(asset))
+        bars_count = 100
+        hold = 10
+        if "--bars" in args:
+            idx = args.index("--bars")
+            if idx + 1 < len(args):
+                bars_count = int(args[idx + 1])
+        if "--hold" in args:
+            idx = args.index("--hold")
+            if idx + 1 < len(args):
+                hold = int(args[idx + 1])
+        asyncio.run(_backtest_mode(asset, bars_count, hold))
     elif mode == "optimize":
         asset = args[1] if len(args) > 1 else None
         if not asset:
@@ -131,17 +141,17 @@ async def _signal_mode(local_only: bool) -> None:
             await auth.close()
 
 
-async def _backtest_mode(asset: str) -> None:
+async def _backtest_mode(asset: str, bars: int = 100, hold: int = 10) -> None:
     from .auth.tradingview_auth import TradingViewAuth
-    from .backtester.backtester import Backtester, BacktestConfig
+    from .backtester.backtester import Backtester
 
     auth = TradingViewAuth()
     try:
         _, _, page = await auth.launch()
         bt = Backtester(page)
-        await bt.run(BacktestConfig(symbol=asset, bars=200, timeframe="1D"))
-        print("\nDone. Browser staying open for 10s...")
-        await page.wait_for_timeout(10_000)
+        await bt.run(symbol=asset, bars=bars, hold_bars=hold)
+        print("\nDone. Browser staying open for 5s...")
+        await page.wait_for_timeout(5_000)
     except Exception as e:
         print(f"Fatal error: {e}")
     finally:
